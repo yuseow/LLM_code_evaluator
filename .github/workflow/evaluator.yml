@@ -1,0 +1,266 @@
+name: DEV VERSION - Tabular Code Evaluation Pipeline (Issue Level)
+on: 
+  workflow_dispatch:
+    inputs:
+      clone_url:
+        description: "git repo to clone"
+        required: true
+        default: ""
+        type: string
+      pr_number:
+        description: "push request number"
+        required: true
+        default: ""
+        type: string
+      branch_name:
+        description: "branch that the learner is pushing for evaluation"
+        required: true
+        default: ""
+        type: string
+      sprint_number:
+        description: "sprint that we are evaluating"
+        required: true
+        default: ""
+        type: string
+      issue_number:
+        description: "issue that we are evaluating"
+        required: true
+        default: ""
+        type: string
+      psid:
+        description: "problem statement id / project id"
+        required: true
+        default: ""
+        type: string
+      userid:
+        description: "userid"
+        required: true
+        default: ""
+        type: string
+      learner_email:
+        description: "learner email to send report to"
+        required: false
+        default: ""
+        type: string
+      workflow_stage:
+        description: "which workflow stage the sprint should be routed to"
+        required: true
+        default: ""
+        type: string
+
+concurrency:
+  group: ${{ github.event.inputs.clone_url }}-${{ github.event.inputs.branch_name }}-${{ github.event.inputs.pr_number }}
+  cancel-in-progress: true
+  
+env:
+  WEBHOOK: ${{ vars.WEBHOOK }}
+  PM_AGENT: ${{ vars.PM_AGENT }}
+  DB_INSERT_ENDPOINT: ${{ vars.DB_INSERT_ENDPOINT }}
+  DB_QUERY_ENDPOINT: ${{ vars.DB_QUERY_ENDPOINT }}
+  DOCKER_IMAGE: ${{ vars.DOCKER_IMAGE }}
+
+jobs:  
+  prep_and_execute:
+    runs-on: [self-hosted, k8s]
+    # runs-on: ubuntu-latest
+    outputs: 
+      run_score_status: ${{ steps.determine_score_status.outputs.score_status }}
+    steps:
+      - name: Cleanup any old folders in runner
+        run: |
+          ls -la ./
+          rm -rf ./* || true
+          rm -rf ./.??* || true
+          ls -la ./
+          
+      - name: Install pip
+        run: |
+          sudo apt-get update
+          sudo apt-get install python3 python3-pip -y
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          
+      - name: Git clone
+        id: git_clone
+        shell: bash
+        run: |
+          AUTH_URL=$(echo ${{inputs.clone_url}} | awk -v gh_token="${{ secrets.GH_TOKEN }}" '{gsub("https://github.com", "https://" gh_token "@github.com", $0); print $0}')
+          echo $AUTH_URL
+          git clone -b ${{inputs.branch_name}} $AUTH_URL learner_code
+          
+          ls
+          echo "changing directory into learner_code"
+          cd learner_code
+          echo "listing out contents in the learner_code"
+          ls
+          echo "going out of the learner_code"
+          cd ..
+          pwd
+          
+      - name: Download data
+        id: download_data
+        if: ${{ inputs.workflow_stage == 'exec' }}
+        shell: bash
+        run: |
+          mkdir -p -m 755 ./learner_code/data/
+          # pip3 install azure-cli
+          az storage blob download \
+          --account-name ${{ vars.AZURE_BLOB_STORAGE_ACCOUNT_NAME }} \
+          --container-name data-psid-${{inputs.psid}} \
+          --name data.csv \
+          --file ./learner_code/data/data.csv \
+          --account-key ${{secrets.AZURE_BLOB_STORAGE_ACCOUNT_KEY}}
+          cd learner_code 
+          ls
+          
+      - name: Run learner's code
+        id: run_learner_code
+        if: ${{ inputs.workflow_stage == 'exec' }}
+        shell: bash
+        run: |          
+          cd learner_code
+          ls
+          pip3 install -r requirements.txt >> learner_code_output.log 2>&1 || echo "Failed to install dependencies from requirements.txt" >> learner_code_output.log
+          python3 main.py >> learner_code_output.log 2>&1
+          
+      - name: Upload run logs
+        id: upload_run_logs
+        uses: actions/upload-artifact@v3
+        if: ${{ always() && inputs.workflow_stage == 'exec' }}
+        with:
+          name: learner_code_output
+          path: learner_code/learner_code_output.log
+        env:
+          GITHUB_URL: ${{inputs.clone_url}}
+          PR_NUM: ${{inputs.pr_number}}
+          BRANCH_NAME: ${{inputs.branch_name}}
+          SPRINT: ${{inputs.sprint_number}}
+          PSID: ${{inputs.psid}}
+          USERID: ${{inputs.userid }}
+          
+      - name: Determine score status
+        id: determine_score_status
+        if: always()
+        run: |
+          if [ "${{ steps.run_learner_code.outcome }}" == 'success' ] || [ "${{ inputs.workflow_stage }}" == 'eval' ]; then
+            echo "score_status=pass" >> $GITHUB_OUTPUT
+          else 
+            echo "score_status=fail" >> $GITHUB_OUTPUT
+          fi
+          echo "github output for score status is" $GITHUB_OUTPUT
+          
+      - name: Write execute logs to DB
+        if: ${{ always() && inputs.workflow_stage == 'exec' }}
+        run: |
+          curl -X 'POST' \
+          '${{env.WEBHOOK}}/webhook/insert_to_user_score_log' \
+          -H 'accept: application/json' \
+          -H 'Content-Type: application/json' \
+          -d '{
+          "userid": "${{inputs.userid}}",
+          "psid": "${{inputs.psid}}",
+          "eval_sprint": "${{inputs.sprint_number}}",
+          "eval_issue": "${{inputs.issue_number}}",
+          "stage": 1,
+          "score_number": 0,
+          "score_status": "${{ steps.determine_score_status.outputs.score_status }}",
+          "current_sprint": "${{inputs.sprint_number}}",
+          "current_issue": "${{inputs.issue_number}}" }'
+          
+      - name: Add comment to PR
+        id: add_issue_comment
+        if: ${{ always() && inputs.workflow_stage == 'exec' }}
+        run: |  
+          echo "learner_git" ${{inputs.clone_url}}   
+          echo "pull_request_number" ${{inputs.pr_number}}
+          
+          curl -X 'POST' \
+          '${{env.PM_AGENT}}/pm_agent/leave_comment_issues' \
+          -H 'accept: application/json' \
+          -H 'Content-Type: multipart/form-data' \
+          -F 'learner_git=${{inputs.clone_url}}' \
+          -F 'pull_request_number= ${{inputs.pr_number}}' \
+          -F 'log_file=@learner_code/learner_code_output.log'
+          
+      - name: Close PR if execute fail
+        id: close_failed_pr
+        if: ${{ always() && steps.determine_score_status.outputs.score_status == 'fail' && inputs.workflow_stage == 'exec' }}
+        run: | 
+          echo "closing the PR cause execution has failed, code cannot run"
+          curl -X 'POST' \
+          '${{env.PM_AGENT}}/pm_agent/pull_request_handler' \
+          -H 'accept: application/json' \
+          -H 'Content-Type: application/json' \
+          -d '{
+          "action": "close",
+          "pull_request_number": "${{inputs.pr_number}}",
+          "learner_git": "${{inputs.clone_url}}",
+          "userid": "${{inputs.userid}}",
+          "psid": "${{inputs.psid}}",
+          "sprint": "${{inputs.sprint_number}}",
+          "issue": "${{inputs.issue_number}}" }'
+          
+  evaluate_code:
+    runs-on: [self-hosted, k8s]
+    # runs-on: ubuntu-latest
+    needs: prep_and_execute
+    if: ${{ needs.prep_and_execute.outputs.run_score_status == 'pass' || inputs.workflow_stage == 'eval' }}
+    steps:
+      - name: Cleanup any old folders in runner
+        run: |
+          ls -la ./
+          rm -rf ./* || true
+          rm -rf ./.??* || true
+          ls -la ./
+          
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.AZURE_CR_LOGIN_SERVER }}
+          username: ${{ secrets.AZURE_DOCKER_USERNAME }}
+          password: ${{ secrets.AZURE_DOCKER_PASSWORD }}
+          
+      - name: load docker image
+        env:
+          GITHUB_URL: ${{inputs.clone_url}}
+          PR_NUM: ${{inputs.pr_number}}
+          BRANCH_NAME: ${{inputs.branch_name}}
+          SPRINT: ${{inputs.sprint_number}}
+          ISSUE:  ${{inputs.issue_number}}
+          PSID: ${{inputs.psid}}
+          USERID: ${{inputs.userid }}
+          AZURE_OPENAI_API_KEY: ${{secrets.AZURE_OPENAI_API_KEY}}
+          AZURE_OPENAI_ENDPOINT: ${{secrets.AZURE_OPENAI_ENDPOINT}}
+          AZURE_CLOUD_STORAGE_CONNECTION_STRING: ${{secrets.AZURE_CLOUD_STORAGE_CONNECTION_STRING}}
+          AZURE_BLOB_STORAGE_ACCOUNT_KEY: ${{secrets.AZURE_BLOB_STORAGE_ACCOUNT_KEY}}
+          AZURE_DOCKER_USERNAME: ${{secrets.AZURE_DOCKER_USERNAME}}
+          AZURE_DOCKER_PASSWORD: ${{secrets.AZURE_DOCKER_PASSWORD}}
+          SMTP_PASSWORD: ${{secrets.SMTP_PASSWORD}}
+          PM_MR_ENDPOINT: ${{env.PM_AGENT}}/pm_agent/pull_request_handler
+          DB_INSERT_ENDPOINT: ${{ vars.DB_INSERT_ENDPOINT }}
+          DB_QUERY_ENDPOINT: ${{ vars.DB_QUERY_ENDPOINT }}
+
+        if: success()
+        run: |
+          echo "git clone first"
+          AUTH_URL=$(echo ${{inputs.clone_url}} | awk -v gh_token="${{ secrets.GH_TOKEN }}" '{gsub("https://github.com", "https://" gh_token "@github.com", $0); print $0}')
+          echo $AUTH_URL
+          git clone -b ${{inputs.branch_name}} $AUTH_URL learner_code
+          echo "starting docker pull and docker run"
+          docker pull ${{env.DOCKER_IMAGE}}
+          # docker pull ${{ vars.AZURE_CR_LOGIN_SERVER }}/trbb-b14/jery/evaluationreport:staging
+          docker run -v ${{ github.workspace }}/learner_code:/app/appuser/learner_code \
+          -e AZURE_OPENAI_API_KEY="$AZURE_OPENAI_API_KEY" \
+          -e AZURE_OPENAI_ENDPOINT="$AZURE_OPENAI_ENDPOINT" \
+          -e AZURE_BLOB_STORAGE_ACCOUNT_KEY=$AZURE_BLOB_STORAGE_ACCOUNT_KEY \
+          -e AZURE_CLOUD_STORAGE_CONNECTION_STRING="$AZURE_CLOUD_STORAGE_CONNECTION_STRING" \
+          -e SMTP_PASSWORD=$SMTP_PASSWORD \
+          -e USERID=$USERID \
+          -e SPRINT="$SPRINT" \
+          -e ISSUE="$ISSUE" \
+          -e PSID="$PSID" \
+          -e PR_NUM=$PR_NUM \
+          -e GITHUB_URL=$GITHUB_URL \
+          -e DB_INSERT_ENDPOINT=$DB_INSERT_ENDPOINT \
+          -e DB_QUERY_ENDPOINT=$DB_QUERY_ENDPOINT \
+          -e PM_MR_ENDPOINT=$PM_MR_ENDPOINT ${{env.DOCKER_IMAGE}}
+          # -e PM_MR_ENDPOINT=$PM_MR_ENDPOINT ${{ vars.AZURE_CR_LOGIN_SERVER }}/trbb-b14/jery/evaluationreport:staging
