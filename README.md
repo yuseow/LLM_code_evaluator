@@ -1,2 +1,2 @@
-# LLM_code_evaluator
+# (WIP) LLM code evaluator
 Using local LLM to evaluate code
